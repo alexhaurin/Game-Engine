@@ -1,0 +1,191 @@
+#version 450
+
+#define HALF_PI 1.5707963268
+#define PI      3.1415926536
+#define TWO_PI  6.2831853072
+
+struct InstanceData
+{
+    vec4 posXYZhashW;
+    vec4 color;
+    vec4 windForce;
+    float rotation;
+    float heightOffset;
+    int shouldDraw;
+    float pad2;
+};
+
+// Must change in grassVert as well
+struct Frustum
+{
+    vec4 top;
+    vec4 bottom;
+    vec4 right;
+    vec4 left;
+    vec4 far;
+    vec4 near;
+};
+
+// ============= Grass Descriptor Set =========== //
+layout(std140, set = 0, binding = 0) buffer SSBOOut
+{
+    uint instanceCount;
+    InstanceData instances[];
+};
+layout(std140, set = 0, binding = 1) buffer SSBOLowOut
+{
+    uint instanceCountLow;
+    InstanceData instancesLow[];
+};
+layout(std140, set = 0, binding = 2) buffer SSBOFlowerOut
+{
+    uint instanceCountFlowers;
+    InstanceData instancesFlowers[];
+};
+
+// Also used in grassVert shader
+layout(std140, set = 0, binding = 3) uniform constants {
+    Frustum frustum;
+
+    vec4 viewPos;
+    vec4 viewDir;
+    vec4 windSimCenter;
+    vec4 pad;
+
+    float r;
+    float time;
+} ubo;
+layout(set = 0, binding = 4) uniform sampler2D colorMap;
+// ================================================ //
+
+// ================== Wind Descriptor Set ====================== //
+layout(std140, set = 1, binding = 0) readonly buffer SSBOIn
+{
+    vec4 globalWindVector;
+    vec4 windData[];
+};
+layout(set = 1, binding = 1) uniform sampler2D perlinNoise;
+// ============================================================== //
+
+float rand(vec2 co) { return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453); }
+float rand(float n) { return fract(cos(n) * 53758.5453123); }
+float lengthSq(vec3 in_from, vec3 in_to) { return pow(in_from.x - in_to.x, 2) + pow(in_from.y - in_to.y, 2) + pow(in_from.z - in_to.z, 2); }
+float lengthSq(vec2 in_from, vec2 in_to) { return pow(in_from.x - in_to.x, 2) + pow(in_from.y - in_to.y, 2); }
+
+uint IX(uint x, uint y) { return (x + (y * 50)); }
+
+layout (local_size_x = 16, local_size_y = 1, local_size_z = 16) in;
+
+const float TEXTURE_SIZE             = 50.0; // meters of real world space the textures take up
+const int   WIND_SIM_SIZE            = 50; // Width / height of tiles in wind simulation. MUST UPDATE IN WIND SYSTEM CPU SIDE
+const float WIND_TILE_SIZE           = 1.0; // meters
+const float GRASS_SPACING            = 0.13; // approx grass blades per meter
+const float MAX_GRASS_DISTANCE_SQ    = 20000.0;
+const float GRASS_LOW_DISTANCE       = 50.0; // Distance (in meters squared) from the camera when we should switch to the low poly grass blade
+const float GRASS_VARIABILITY_COL    = 0.05; // 0 means texture / wind samling happens right at grass pos, 1 means the grass samples a random point on the texture regardless of where it is
+const float GRASS_VARIABILITY_WIND   = 0.002; // 0 means texture / wind samling happens right at grass pos, 1 means the grass samples a random point on the texture regardless of where it is
+const float GRASS_CULLING_RADIUS     = 1.0; // How far out a grass blade has to be from the frustum to be culled
+uvec3 GLOBAL_INVOCATION_COUNT = gl_NumWorkGroups * gl_WorkGroupSize; 
+
+// Used to check if a bounding sphere should be culled
+bool IsOnPlane(vec4 plane, vec3 sphereCenter)
+{
+    float signedDistToPlane = dot(plane.xyz, sphereCenter) - plane.w;
+    return signedDistToPlane + GRASS_CULLING_RADIUS > 0;
+}
+
+void main()
+{
+    // ---- Set up data for a new grass blade ---- //
+    float random  = rand(vec2(gl_GlobalInvocationID.x, gl_GlobalInvocationID.z));
+    float random2 = rand(vec2(gl_GlobalInvocationID.z / gl_GlobalInvocationID.x, gl_GlobalInvocationID.x + random));
+    float random3 = rand(vec2(gl_GlobalInvocationID.x / random2, gl_GlobalInvocationID.x * gl_GlobalInvocationID.z));
+    
+    // ---- First calculate the possible grass blade's position ---- //
+    vec3 bladePos = vec3(gl_GlobalInvocationID.x * GRASS_SPACING, 0.0, gl_GlobalInvocationID.z * GRASS_SPACING);
+    bladePos.x -= (GLOBAL_INVOCATION_COUNT.x * GRASS_SPACING) / 2.0; // centers blades around origin
+    bladePos.z -= (GLOBAL_INVOCATION_COUNT.z * GRASS_SPACING) / 2.0;
+    // Jitter x and z for randomness
+    bladePos.x += random / 5;
+    bladePos.z += random / 5;
+
+    // ---- Now perform culling to determine if we want to add a grass blade to our buffer ---- //
+    const vec3 grassCenter = bladePos;
+    const float grassRadius = 1;
+    if (!IsOnPlane(ubo.frustum.left, grassCenter))   { return; }
+    if (!IsOnPlane(ubo.frustum.right, grassCenter))  { return; }
+    if (!IsOnPlane(ubo.frustum.far, grassCenter))    { return; }
+    if (!IsOnPlane(ubo.frustum.near, grassCenter))   { return; }
+    if (!IsOnPlane(ubo.frustum.top, grassCenter))    { return; }
+    if (!IsOnPlane(ubo.frustum.bottom, grassCenter)) { return; }
+
+    // Determine the grass type
+    float distanceSq = pow(ubo.viewPos.x - bladePos.x, 2) + pow(ubo.viewPos.y - bladePos.y, 2) + pow(ubo.viewPos.z - bladePos.z, 2);
+    if (distanceSq > MAX_GRASS_DISTANCE_SQ) { return; } // Grass is too far away
+
+    uint arrayOffset = 0; // offset into the global grass ssbo
+    bool isFlower = random > 1.0;
+    bool isGrassLow = false;
+    if (distanceSq > GRASS_LOW_DISTANCE && !isFlower)
+    {
+        isGrassLow = true;
+    }
+
+    if (isFlower)        { arrayOffset = atomicAdd(instanceCountFlowers, 1); }
+    else if (isGrassLow) { arrayOffset = atomicAdd(instanceCountLow, 1); }
+    else                 { arrayOffset = atomicAdd(instanceCount, 1); }
+
+    // Calculate wind simulation index
+    ivec2 windSimIndex = ivec2((bladePos.z - ubo.windSimCenter.z) / WIND_TILE_SIZE, -(bladePos.x - ubo.windSimCenter.z) / WIND_TILE_SIZE);
+    // Above gets it centered around 0, so change the index from -25 -> 25 to 0 -> 50
+    windSimIndex.x += WIND_SIM_SIZE / 2;
+    windSimIndex.y += WIND_SIM_SIZE / 2;
+
+    // Calculate specific blade attributes using the in color map
+    vec3 bladeColor = vec3(0, 0, 0);
+    vec2 textureCoords = vec2((bladePos.x + random * GRASS_VARIABILITY_COL) / TEXTURE_SIZE, (bladePos.z + random * GRASS_VARIABILITY_COL) / TEXTURE_SIZE); // TODO: center
+    bladeColor = texture(colorMap, textureCoords).rgb;
+
+    // Scroll the perlin noise based on the global wind vector // TODO: speed
+    vec2 windTextureCoords = vec2(((random2 * GRASS_VARIABILITY_WIND) + textureCoords.x - (ubo.time/8000.0) * globalWindVector.z), (random2 * GRASS_VARIABILITY_WIND) + (textureCoords.y - (ubo.time/8000.0) * globalWindVector.x));
+    vec4 totalWind = globalWindVector; // Sum of all the wind at the position of the grass blade
+    totalWind.w *= texture(perlinNoise, windTextureCoords).r;
+
+    vec4 instanceWindData = windData[IX(uint(windSimIndex.x), uint(windSimIndex.y))];
+    if ((windSimIndex.x <= 49 && windSimIndex.x >= 0) && (windSimIndex.y >= 0 && windSimIndex.y <= 49))
+    {
+        vec3 n = totalWind.xyz;
+        vec3 i = instanceWindData.xyz;
+        vec3 c = n * totalWind.w + i * instanceWindData.w;
+        c = normalize(c);
+        totalWind = vec4(c, min(1.0, totalWind.w + instanceWindData.w));
+    }
+
+    if (isFlower)
+    {
+        instancesFlowers[arrayOffset].windForce = totalWind;
+        instancesFlowers[arrayOffset].posXYZhashW.xyz = bladePos;
+        instancesFlowers[arrayOffset].posXYZhashW.w = random;
+        instancesFlowers[arrayOffset].rotation = random3 * PI;
+        instancesFlowers[arrayOffset].color = vec4(207/255.0 * random / 10, random2 / 6.0, random3 / 6.0, 1);
+        instancesFlowers[arrayOffset].heightOffset = 0.3;//  + (random / 5 - 0.1);
+    }
+    else if (isGrassLow)
+    {
+        instancesLow[arrayOffset].windForce = totalWind;
+        instancesLow[arrayOffset].posXYZhashW.xyz = bladePos;
+        instancesLow[arrayOffset].posXYZhashW.w = random;
+        instancesLow[arrayOffset].rotation = random3 * PI;
+        instancesLow[arrayOffset].color = vec4(bladeColor.xyz, 1);
+        instancesLow[arrayOffset].heightOffset = float(bladeColor.g) * 4;
+    }
+    else
+    {
+        instances[arrayOffset].windForce = totalWind;
+        instances[arrayOffset].posXYZhashW.xyz = bladePos;
+        instances[arrayOffset].posXYZhashW.w = random;
+        instances[arrayOffset].rotation = random3 * PI;
+        instances[arrayOffset].color = vec4(bladeColor.xyz, 1);
+        instances[arrayOffset].heightOffset = float(bladeColor.g) * 4;
+    }
+}
